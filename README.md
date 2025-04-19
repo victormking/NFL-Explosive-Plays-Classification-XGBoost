@@ -51,8 +51,23 @@ plaintext
 
 ### 🔍 Model Performance Summary
 
-- Accuracy: **68.3%**
-- ROC AUC: **0.681**
-- Brier Score: **0.1926**
-- Cross-validation: **10-fold, stratified**
-- Algorithm: **XGBoost (Grid + Latin Hypercube Tuned)**
+
+Accuracy: ~61.3%
+This means the model correctly predicted whether a play was explosive or not about 61% of the time.
+
+ROC AUC: 0.6923
+This score shows the model has a moderate ability to distinguish between explosive and non-explosive plays. AUC of 0.5 = random guessing, so 0.6923 is decent, especially for football data.
+
+Brier Score: 0.2192
+Lower is better here. This value reflects how well-calibrated the predicted probabilities are. A score around 0.21–0.22 is acceptable for imbalanced binary classification problems.
+
+Confusion Matrix (Threshold = 0.5):
+
+True Negatives (Top Left): 21,980
+
+False Positives (Top Right): 2,376
+
+False Negatives (Bottom Left): 14,572
+
+True Positives (Bottom Right): 4,905
+This tells us that the model missed quite a few explosive plays (high false negatives) but did a good job not over-predicting them (low false positives).
