@@ -28,8 +28,7 @@ Using a powerful gradient boosting classifier (XGBoost), we trained and evaluate
 │
 ├── scripts/
 │   └── Xboost_NFL_Explosive_Plays.Rmd – Fully commented final source code
-│
-└── README.md – This file
+
 
 ## 📊 Visual Highlights
 
