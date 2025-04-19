@@ -30,3 +30,24 @@ Using a powerful gradient boosting classifier (XGBoost), we trained and evaluate
 │   └── Xboost_NFL_Explosive_Plays.Rmd – Fully commented final source code
 │
 └── README.md – This file
+
+
+## 📊 Visual Highlights
+
+### Top 15 Players by Average Explosives Over Expected (XOE)
+![Top 15 Players by Avg XOE](outputs/Step 14/top_15_xoe_with_headshots.png)
+
+---
+
+### Team-Level XOE Comparison
+![Team XOE](outputs/Step 13 D/xoe_by_team_logos.png)
+
+---
+
+### Explosiveness by Offensive Personnel
+![XOE by Offensive Personnel](outputs/Step 13 E/xoe_by_offensive_personnel.png)
+
+---
+
+### Explosiveness by Defensive Personnel
+![XOE by Defensive Personnel](outputs/Step 13 E/xoe_by_defensive_personnel.png)
