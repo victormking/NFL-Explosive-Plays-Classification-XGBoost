@@ -32,19 +32,4 @@ plaintext
 ## 📈 Visual Highlights
 
 #### 🧨 Top 15 Players by Average Explosives Over Expected (XOE)  
-![Top 15 Players by Avg XOE](outputs/Step%2014%20A/top_15_xoe_with_headshots.png)
-
----
-
-#### 🧮 Team-Level Evaluation: Precision, Recall, and F1 Across Thresholds  
-![Threshold Sensitivity Curve](outputs/Step%209/threshold_sensitivity_plot.png)
-
----
-
-#### 🧠 XGBoost Feature Importance  
-![Top 20 Feature Importances](outputs/Step%2010/xgb_top20_feature_importance.png)
-
----
-
-#### 🚀 Player-Level Performance: Explosives vs Expected  
-![Top 20 XOE Players](outputs/Step%2013%20A/top20_xoe_players.png)
+<img src="https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/raw/main/Outputs/Step%2014%20A/top_15_xoe_with_headshots.png" width="700"/>
