@@ -29,8 +29,6 @@ plaintext
 ├── scripts/
 │   └── Xboost_NFL_Explosive_Plays.Rmd – Fully commented final source code
 
-
-
 ## 📈 Visual Highlights
 
 #### 🧨 Top 15 Players by Average Explosives Over Expected (XOE)  
