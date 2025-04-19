@@ -12,7 +12,7 @@ Using a powerful gradient boosting classifier (XGBoost), we trained and evaluate
 
 ## 📁 Repository Structure
 
-```plaintext
+plaintext
 📦 NFL-Explosive-Plays-Classification-XGBoost
 │
 ├── data/
