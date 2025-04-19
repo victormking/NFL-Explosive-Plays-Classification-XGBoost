@@ -36,11 +36,6 @@ plaintext
 
 ---
 
-#### 🧪 Team-Level Evaluation: Precision, Recall, and F1 Across Thresholds  
-<img src="https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/raw/main/Outputs/Step%209/threshold_sensitivity_plot.png" width="700"/>
-
----
-
 #### 🧠 XGBoost Feature Importance  
 <img src="https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/raw/main/Outputs/Step%2010/xgb_top20_feature_importance.png" width="700"/>
 
@@ -48,6 +43,11 @@ plaintext
 
 #### 👤 Player-Level Performance: Explosives vs Expected  
 <img src="https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/raw/main/Outputs/Step%2013%20A/top20_xoe_players.png" width="700"/>
+
+---
+
+#### 🧪 Team-Level Evaluation: Precision, Recall, and F1 Across Thresholds  
+<img src="https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/raw/main/Outputs/Step%209/threshold_sensitivity_plot.png" width="700"/>
 
 ### 🔍 Model Performance Summary
 
