@@ -48,3 +48,11 @@ plaintext
 
 #### 👤 Player-Level Performance: Explosives vs Expected  
 <img src="https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/raw/main/Outputs/Step%2013%20A/top20_xoe_players.png" width="700"/>
+
+### 🔍 Model Performance Summary
+
+- Accuracy: **68.3%**
+- ROC AUC: **0.681**
+- Brier Score: **0.1926**
+- Cross-validation: **10-fold, stratified**
+- Algorithm: **XGBoost (Grid + Latin Hypercube Tuned)**
