@@ -1,0 +1,1898 @@
+---
+title: "SAL613_Week8_Final"
+output: html_document
+date: "2025-04-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+
+# Core Data Science and Visualization Packages
+library(tidyverse)     # For data wrangling and visualization (ggplot2, dplyr, etc.)
+library(ggplot2)       # Core plotting system (included in tidyverse but kept for clarity)
+library(scales)        # Formatting scales in plots (e.g., comma, percent)
+library(ggrepel)       # Smarter text labels in ggplot (avoids overlapping)
+library(ggtext)        # Rich text elements in ggplot (bold, markdown in titles, etc.)
+library(ggpmisc)       # Adds regression equations, R² to plots (used with stat_poly_eq)
+library(ggridges)      # Ridge/density plots — good for EPA distributions etc.
+library(ggfx)          # For advanced visual effects like shadows, glows
+library(geomtextpath)  # For text along paths in plots (stylized plot annotations)
+
+# Image and Logo Handling
+library(ggimage)       # Use images (e.g., team logos) as plot points
+library(cropcircles)   # Crop circular logos — useful for team badges
+library(magick)        # Advanced image processing (not always needed, but powerful)
+
+# Text and Report Formatting
+library(glue)          # Easy string interpolation (e.g., glue("Player: {name}"))
+library(gt)            # Professional-looking tables
+library(gtExtras)      # Add logos, color bars, and themes to GT tables (e.g., ESPN style)
+
+# Modeling and Machine Learning
+library(tidymodels)    # Tidy framework for modeling (recipes, resampling, tuning, etc.)
+library(doParallel)    # For parallel processing (used with tune_grid(), etc.)
+library(glmnet)        # For regularized regression (e.g., multinomial logistic regression)
+library(bonsai)        # Interface to LightGBM and XGBoost within tidymodels
+library(xgboost)       # Underlying gradient boosting implementation (if not using bonsai)
+library(themis)        # Handles class imbalance (e.g., downsampling/upsampling)
+
+# Data Manipulation Helpers
+library(data.table)    # High-performance data manipulation (faster than dplyr for big data)
+
+# NFL-Specific Packages
+library(nflverse)      # Central package that loads nflreadr, nflplotR, and friends
+library(nflreadr)      # For pulling play-by-play, rosters, participation, teams, NGS data
+
+# Correlation + EDA
+library(corrplot)      # For visualizing correlation matrices
+
+# Parallel Planning
+library(future)        # For `plan(multisession)` parallel tuning setup
+library(doParallel)
+library(vip)
+library(nflplotR)
+library(gt)
+library(nflfastR)  # for teams_colors_logos
+
+
+# Load the full Play-by-Play dataset (2016–2022)
+pbp <- nflreadr::load_pbp(2016:2022)
+
+
+
+xgb_results <- readRDS("data/xgb_tuning_results.RDS")
+best_params <- read_csv("data/xgb_best_params.csv")
+
+
+```
+
+
+```{r}
+
+
+# ────────────────────────────────────────────────────────────────
+# Step 2: Filter Valid Pass Attempts + Tag Explosives + Add Defensive Context
+# ────────────────────────────────────────────────────────────────
+# This chunk focuses on preparing the dataset for modeling by isolating valid
+# pass attempts from the raw play-by-play data (`pbp`). It:
+# 
+# • Filters to only include regular season forward pass attempts that are 
+#   fully populated (no missing `yards_gained`, `receiver_player_name`, or `air_yards`).
+# 
+# • Tags each pass play as an "explosive" if it gained 13+ yards and was a 
+#   completed pass — aligning with your custom explosive play threshold.
+# 
+# • Adds defensive strength context by calculating each defense’s average 
+#   yards allowed per pass attempt (`def_ypa`) by season, and joins this back 
+#   into the pass data for contextual modeling.
+# 
+# This engineered `pass_attempts` object is one of the two core datasets that 
+# feed into the combined `explosive_plays` modeling data later in the workflow
+
+
+# Filter for regular season valid forward passes
+pass_attempts <- pbp %>%
+  filter(
+    season_type == "REG",
+    pass_attempt == 1,
+    !is.na(yards_gained),
+    !is.na(receiver_player_name),
+    !is.na(air_yards)
+  ) %>%
+  mutate(
+    # FIX: Define explosive play IMMEDIATELY for consistency
+    explosive = ifelse(yards_gained >= 13 & complete_pass == 1, 1, 0)
+  )
+
+# Calculate defense's avg yards allowed per attempt (YPA)
+def_ypa <- pass_attempts %>%
+  filter(!is.na(defteam)) %>%
+  group_by(defteam, season) %>%
+  summarize(def_ypa = mean(yards_gained), .groups = "drop")
+
+# Join defensive YPA context back into pass_attempts
+pass_attempts <- pass_attempts %>%
+  left_join(def_ypa, by = c("defteam", "season"))
+
+
+# ───────────────────────────────
+# SAVE Step 2 Outputs
+# ───────────────────────────────
+
+# Create the directory if it doesn't exist
+if (!dir.exists("data")) dir.create("data")
+
+# Save pass_attempts and def_ypa
+write_csv(pass_attempts, "data/pass_attempts.csv")
+write_csv(def_ypa, "data/def_ypa.csv")
+
+
+```
+
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# Step 3: Join Participation Data + Add Receiver-Level NGS Metrics
+# ────────────────────────────────────────────────────────────────
+# This chunk enriches the `pass_attempts` dataset by incorporating 
+# formation-level and player tracking context. Specifically:
+#
+# • Loads and selects relevant fields from NFL participation data 
+#   (e.g., offensive/defensive personnel, defenders in the box), 
+#   which adds valuable structural information to each play.
+#
+# • Joins this participation data into the existing `pass_attempts` 
+#   dataset using `game_id`, `play_id`, and `posteam` as keys.
+#
+# • Loads Next Gen Stats (NGS) for receiving plays, focusing on 
+#   receiver-level metrics — `avg_cushion` and `avg_separation` — 
+#   which quantify defender proximity at the snap and during routes.
+#
+# • Merges the NGS metrics into the `pass_attempts` data using 
+#   `season`, `week`, and `receiver_player_name` for alignment.
+#
+# This step enhances the modeling dataset with advanced spatial 
+# features and pre-snap structure variables critical for predicting 
+# explosive play likelihood on pass attempts.
+
+
+# 1. Load participation data
+participation <- nflreadr::load_participation(2016:2022) %>%
+  select(
+    nflverse_game_id, play_id, possession_team,
+    offense_formation, offense_personnel,
+    defense_personnel, defenders_in_box
+  )
+
+# 2. Join participation to pass_attempts
+pass_attempts <- pass_attempts %>%
+  left_join(
+    participation,
+    by = c(
+      "game_id" = "nflverse_game_id",
+      "play_id" = "play_id",
+      "posteam" = "possession_team"
+    )
+  )
+
+# 3. Load NGS RECEIVING stats (receiver-level)
+ngs_receiving <- load_nextgen_stats(
+  stat_type = "receiving",  # For receiving NGS stats, change to "rushing" if needed for rush stats
+  seasons = 2016:2022
+) %>%
+  filter(week > 0, season_type == "REG") %>%
+  select(
+    season, week,
+    receiver_player_name = player_display_name,
+    avg_cushion,
+    avg_separation
+  )
+
+# 4. Join into pass_attempts on receiver name + week + season
+pass_attempts <- pass_attempts %>%
+  left_join(
+    ngs_receiving,
+    by = c("season", "week", "receiver_player_name")
+  )
+
+# Confirm fields added
+glimpse(pass_attempts)
+
+
+# ───────────────────────────────
+# SAVE Step 3 Outputs
+# ───────────────────────────────
+
+# Ensure data directory exists
+if (!dir.exists("data")) dir.create("data")
+
+# Save participation and NGS receiving data separately
+write_csv(participation, "data/participation_data.csv")
+write_csv(ngs_receiving, "data/ngs_receiving.csv")
+
+# Save updated pass_attempts after all joins
+write_csv(pass_attempts, "data/pass_attempts_with_participation_ngs.csv")
+
+
+```
+
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# Step 4: Process Valid Rush & Scramble Attempts + Defensive Context
+# ────────────────────────────────────────────────────────────────
+# This chunk mirrors the pass data processing but focuses on rushing 
+# and scramble plays. It creates the `rush_attempts` object by:
+#
+# • Filtering for valid rush or QB scramble plays during the regular season, 
+#   with complete `yards_gained` and `rusher_player_name` fields.
+#
+# • Applying a custom explosive play definition for rushes — any rush 
+#   gaining 10+ yards is flagged as explosive.
+#
+# • Adding contextual strength of opposing defenses by calculating each 
+#   defense’s average yards allowed per rush (def_ypa), grouped by team 
+#   and season, and merging it back in.
+#
+# • Joining participation-level metadata (formation and box defenders) 
+#   to the rush data, using the same keys as the pass join: `game_id`, 
+#   `play_id`, and `posteam`.
+#
+# • Pulling in Next Gen Stats (NGS) for rushing, especially `avg_time_to_los`, 
+#   which captures how long a runner took to reach the line of scrimmage — 
+#   an important acceleration/penetration feature.
+#
+# • Validates the presence of key columns needed for modeling, ensuring that 
+#   explosive flags, defenders_in_box, and avg_time_to_los are successfully added.
+#
+# Together with `pass_attempts`, this creates the second major input for 
+# explosive play modeling.
+
+
+
+# 1. Build base rush dataset with custom 15+ yard explosive rule
+rush_attempts <- pbp %>%
+  filter(
+    season_type == "REG",
+    rush_attempt == 1 | qb_scramble == 1,
+    !is.na(yards_gained),
+    !is.na(rusher_player_name)
+  ) %>%
+  mutate(
+    explosive = if_else(yards_gained >= 10, 1, 0),  # your custom threshold
+    rusher_player_name = rusher_player_name         # ensure column is present for NGS join
+  )
+
+# 2. Join defensive YPA context
+rush_def_ypa <- rush_attempts %>%
+  filter(!is.na(defteam)) %>%
+  group_by(defteam, season) %>%
+  summarize(def_ypa = mean(yards_gained), .groups = "drop")
+
+rush_attempts <- rush_attempts %>%
+  left_join(rush_def_ypa, by = c("defteam", "season"))
+
+# 3. Join participation data (offensive/defensive context)
+rush_attempts <- rush_attempts %>%
+  left_join(
+    participation,
+    by = c(
+      "game_id" = "nflverse_game_id",
+      "play_id" = "play_id",
+      "posteam" = "possession_team"
+    )
+  )
+
+# 4. Join NGS by rusher name
+ngs_rushing <- load_nextgen_stats(
+  stat_type = "rushing",  # Change to "receiving" if want receiving stats
+  seasons = 2016:2022
+) %>%
+  filter(week > 0, season_type == "REG") %>%
+  select(
+    season, week,
+    rusher_player_name = player_display_name,
+    avg_time_to_los,
+  )
+
+rush_attempts <- rush_attempts %>%
+  left_join(
+    ngs_rushing,
+    by = c(
+      "season", "week",
+      "rusher_player_name" = "rusher_player_name"
+    )
+  )
+
+# Safety Checks (Ensure important columns are present)
+stopifnot("explosive" %in% names(rush_attempts))
+stopifnot("defenders_in_box" %in% names(rush_attempts))
+stopifnot("avg_time_to_los" %in% names(rush_attempts))  # NGS metric for rushes
+# stopifnot("box_players" %in% names(rush_attempts))  # Removed this, assuming you don't need it
+
+
+# ───────────────────────────────
+# SAVE Step 4 Outputs
+# ───────────────────────────────
+
+# Ensure data directory exists
+if (!dir.exists("data")) dir.create("data")
+
+# Save rush-specific defensive context
+write_csv(rush_def_ypa, "data/rush_def_ypa.csv")
+
+# Save NGS rushing metrics
+write_csv(ngs_rushing, "data/ngs_rushing.csv")
+
+# Save final rush_attempts dataset (includes all context)
+write_csv(rush_attempts, "data/rush_attempts_with_participation_ngs.csv")
+
+
+```
+
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# Step 5: Combine Pass + Rush + Scramble Attempts
+# ────────────────────────────────────────────────────────────────
+# This step consolidates the previously engineered `pass_attempts` and 
+# `rush_attempts` datasets into a unified modeling dataset called 
+# `explosive_plays`. The process ensures all relevant features across 
+# both play types are aligned and standardized:
+#
+# • Standardizes column names to remove suffixes and ensure consistency 
+#   across pass and rush datasets (e.g., `defenders_in_box`, `air_yards`, etc.).
+#
+# • Selects a common set of variables for modeling, including contextual 
+#   features (e.g., defensive strength, box defenders), play identifiers, 
+#   and Next Gen Stats fields (e.g., `avg_cushion` for pass, `avg_time_to_los` 
+#   for rush).
+#
+# • Uses `bind_rows()` to stack pass and rush plays into one cohesive 
+#   data frame: `explosive_plays`.
+#
+# • Performs final sanity checks using `stopifnot()` to confirm that all 
+#   required columns were successfully preserved, especially the key target 
+#   variable (`explosive`) and engineered features (`defenders_in_box`, 
+#   `avg_time_to_los`).
+#
+# The resulting `explosive_plays` object serves as the foundation for all 
+# downstream modeling steps, combining the best features from passing and 
+# rushing data sources into one tidy structure.
+
+
+
+# Step 1: Fix column names for pass_attempts (standardized naming)
+pass_attempts <- pass_attempts %>%
+  rename(
+    offense_formation = offense_formation,          # No change here
+    offense_personnel = offense_personnel,          # No change here
+    defense_personnel = defense_personnel,          # No change here
+    defenders_in_box = defenders_in_box,            # Remove .x suffix
+    avg_cushion = avg_cushion,                      # Remove .x suffix
+    avg_separation = avg_separation                 # Remove .x suffix
+  )
+
+
+# Step 2: Fix column names for rush_attempts (standardized naming)
+rush_attempts <- rush_attempts %>%
+  rename(
+    offense_formation = offense_formation,           # No change here
+    offense_personnel = offense_personnel,           # No change here
+    defense_personnel = defense_personnel,           # No change here
+    defenders_in_box = defenders_in_box,             # No change here
+    avg_time_to_los = avg_time_to_los                # No change here
+    # avg_cushion and avg_separation are not present in rush_attempts, so we won't include them
+  )
+
+
+# Step 3: Review column names to confirm all renaming is correct
+names(pass_attempts)
+names(rush_attempts)
+
+
+# Step 4: Merge the datasets into explosive_plays
+explosive_plays <- bind_rows(
+  pass_attempts %>% 
+    select(play_id, game_id, season, week, posteam, defteam, yards_gained, explosive, play_type, air_yards, def_ypa,
+           offense_formation, offense_personnel, defense_personnel, defenders_in_box, avg_cushion, avg_separation),
+  
+  rush_attempts %>% 
+    select(play_id, game_id, season, week, posteam, defteam, yards_gained, explosive, play_type, air_yards, def_ypa,
+           offense_formation, offense_personnel, defense_personnel, defenders_in_box, avg_time_to_los)
+)
+
+# Perform checks to ensure required columns exist in explosive_plays
+stopifnot("explosive" %in% names(explosive_plays))  # Ensure the 'explosive' column is there
+stopifnot("defenders_in_box" %in% names(explosive_plays))  # Ensure defenders_in_box is there
+stopifnot("avg_time_to_los" %in% names(explosive_plays))  # Ensure avg_time_to_los is present for rush attempts
+
+
+# ───────────────────────────────
+# SAVE Step 5 Outputs
+# ───────────────────────────────
+
+# Ensure data directory exists
+if (!dir.exists("data")) dir.create("data")
+
+# Save the final combined pass + rush dataset
+write_csv(explosive_plays, "data/explosive_plays_combined.csv")
+
+# Optionally also save column names for verification/debugging
+write_lines(names(explosive_plays), "data/explosive_plays_column_names.txt")
+
+```
+
+
+```{r}
+
+
+# ────────────────────────────────────────────────────────────────
+# STEP 6: Feature Engineering + Game Context Integration
+# ────────────────────────────────────────────────────────────────
+
+# In Step 6A, we prepare the `explosive_plays` dataset for modeling by cleaning,
+# transforming, and enhancing core variables. This includes converting key 
+# columns such as `explosive`, `play_type`, and personnel groupings into factors 
+# to support classification. We also impute missing values for critical fields: 
+# air_yards (set to -99 for non-passes), defenders_in_box (median imputation), 
+# and avg_time_to_los (median imputation for rush-only data). These transformations
+# ensure that the resulting `model_data` object is complete, factor-aware, and 
+# free of NA issues that would otherwise break the modeling pipeline.
+
+model_data <- explosive_plays %>%
+  mutate(
+    # Classification target
+    explosive = as.factor(explosive),
+
+    # Convert categorical columns to factors
+    play_type = as.factor(play_type),
+    offense_formation = as.factor(offense_formation),
+    offense_personnel = as.factor(offense_personnel),
+    defense_personnel = as.factor(defense_personnel),
+
+    # Impute missing air_yards (for rush/scramble)
+    air_yards = if_else(is.na(air_yards), -99, air_yards),
+
+    # Impute missing defenders_in_box
+    defenders_in_box = if_else(
+      is.na(defenders_in_box),
+      median(defenders_in_box, na.rm = TRUE),
+      defenders_in_box
+    ),
+
+    # Impute missing NGS metrics (only present for rushes/scrambles)
+    avg_time_to_los = if_else(
+      is.na(avg_time_to_los),
+      median(avg_time_to_los, na.rm = TRUE),
+      avg_time_to_los
+    )
+
+  ) %>%
+  relocate(yards_gained, .after = explosive) %>%
+  drop_na(def_ypa, explosive, play_type)
+
+
+
+# In Step 6B, we enhance `model_data` with environmental features sourced from the 
+# `load_schedules()` metadata, including roof type (indoor/outdoor), field surface, 
+# temperature, and wind conditions. These are imputed as necessary and cast to 
+# appropriate types (e.g., `roof` and `surface` as factors). This contextual 
+# information accounts for game-day conditions that may influence explosiveness 
+# — particularly relevant for weather-sensitive plays like deep passes or cuts.
+
+# Load what IS available in load_schedules()
+games_meta <- nflreadr::load_schedules(2016:2022) %>%
+  select(game_id, roof, surface, temp, wind) %>%
+  rename(
+    game_temperature = temp
+  )
+
+# Join into model_data
+model_data <- model_data %>%
+  left_join(games_meta, by = "game_id") %>%
+  mutate(
+    roof = as.factor(roof),
+    surface = as.factor(surface),
+    game_temperature = if_else(
+      is.na(game_temperature),
+      median(game_temperature, na.rm = TRUE),
+      game_temperature
+    ),
+    wind = if_else(
+      is.na(wind),
+      median(wind, na.rm = TRUE),
+      wind
+    )
+  )
+
+
+
+
+
+# STEP 6C: Add Drive, Score, and Play Context Features + New Feature Engineering
+
+
+# Step 6C introduces drive-level and clock-based context via a join with the 
+# original play-by-play dataset. We engineer several situational features such 
+# as `two_min_warning`, `scoring_opportunity`, `long_down_distance`, and 
+# `late_half` — all of which capture high-leverage or strategic moments in a drive. 
+# We also create a `leverage_score`, which scales the absolute score differential 
+# by the time remaining in the half, to model urgency or comeback pressure. These 
+# new engineered features are central to improving predictive accuracy and capturing 
+# play dynamics that go beyond raw yardage or player-level stats.
+
+
+
+model_data <- model_data %>%
+  left_join(
+    pbp %>%
+      select(game_id, play_id, drive_play_count, score_differential,
+             half_seconds_remaining, down, ydstogo, qtr),  # orrect column name
+    by = c("game_id", "play_id")
+  ) %>%
+  mutate(
+    down = as.factor(down),
+    quarter = as.factor(qtr),  # ename qtr to quarter as a new variable
+
+    # Two-minute warning flag
+    two_min_warning = if_else(
+      quarter %in% c("2", "4") & half_seconds_remaining <= 120,
+      1, 0
+    ),
+    two_min_warning = as.factor(two_min_warning),
+
+    #  NEW FEATURES ADDED BELOW 
+
+    # 1. Red zone scoring opportunity + quarter check
+    scoring_opportunity = if_else(ydstogo <= 20 & qtr >= 2, 1, 0),
+
+    # 2. Long down-distance interaction
+    long_down_distance = case_when(
+      down == "1" & ydstogo >= 10 ~ 1,
+      down == "2" & ydstogo >= 7 ~ 1,
+      down == "3" & ydstogo >= 5 ~ 1,
+      TRUE ~ 0
+    ),
+
+    # 3. Late Half Pressure (not just 2-minute warning)
+    late_half = if_else(
+      (qtr == 2 | qtr == 4) & half_seconds_remaining <= 300,
+      1, 0
+    ),
+
+    # 4. Leverage Score
+    leverage_score = abs(score_differential) / (half_seconds_remaining + 1)
+  )
+
+# ───────────────────────────────
+# SAVE Step 6 Outputs
+# ───────────────────────────────
+
+# Ensure data directory exists
+if (!dir.exists("data")) dir.create("data")
+
+# Save game environmental metadata
+write_csv(games_meta, "data/games_meta_environment.csv")
+
+# Save the fully engineered modeling dataset
+write_csv(model_data, "data/model_data_final_engineered.csv")
+
+# Optionally save a variable list for review/debugging
+write_lines(names(model_data), "data/model_data_column_names.txt")
+
+
+```
+
+
+```{r}
+
+
+# ────────────────────────────────────────────────────────────────
+# STEP 7: Train/Test Split and Preprocessing Pipeline
+# ────────────────────────────────────────────────────────────────
+
+# This step sets up the training and testing structure and defines the preprocessing
+# recipe for modeling. We start by using a stratified `initial_split()` to divide 
+# the data into 80% training and 20% testing sets, ensuring balanced representation 
+# of the target class (`explosive`). This stratification is critical for models 
+# trained on imbalanced datasets, as it preserves the ratio of positives (explosives) 
+# in both the training and evaluation samples.
+
+# We then define a comprehensive `explosive_recipe` using the `recipes` package. 
+# This recipe removes columns that could introduce leakage (IDs, team identifiers, 
+# or season/week context), imputes missing values using median for numeric variables, 
+# encodes categorical variables with one-hot encoding (`step_dummy()`), handles 
+# unknown levels, removes zero-variance predictors, and normalizes all numeric features. 
+# These steps collectively ensure the data is well-conditioned for gradient boosting.
+
+# Importantly, this recipe includes a final `step_upsample()` operation to address 
+# class imbalance, giving explosive plays equal weight during model training. This 
+# technique is especially useful when explosive plays represent a minority class. 
+# A `glimpse()` of the prepped training data confirms that transformations are complete 
+# and that the dataset is ready for resampling and model tuning in Step 8.
+
+# Split into training/testing sets (stratified to balance explosive vs non)
+set.seed(90210)
+splits <- initial_split(model_data, prop = 0.8, strata = explosive)
+train_data <- training(splits)
+test_data  <- testing(splits)
+
+# Final recipe with:
+# - Column removal (IDs, team names, season info, target leakage)
+# - Imputation
+# - One-hot encoding
+# - NA level handling
+# - Zero variance and normalization
+# - NEW: Upsampling to fix class imbalance
+
+explosive_recipe <- recipe(explosive ~ ., data = train_data) %>%
+  step_rm(
+    play_id, game_id, posteam, defteam,
+    season, week, yards_gained, air_yards
+  ) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_upsample(explosive)  # Upsample added here
+
+# Quick check of processed training set
+prep(explosive_recipe) %>% juice() %>% glimpse()
+
+
+# ───────────────────────────────
+# SAVE Step 7 Outputs
+# ───────────────────────────────
+
+# Ensure data directory exists
+if (!dir.exists("data")) dir.create("data")
+
+# Save split objects (optional - use RDS for structure retention)
+saveRDS(splits, "data/train_test_split.rds")
+saveRDS(train_data, "data/train_data_raw.rds")
+saveRDS(test_data,  "data/test_data_raw.rds")
+
+# Save preprocessed training set as CSV (for backup or review)
+prepped_train <- prep(explosive_recipe) %>% juice()
+write_csv(prepped_train, "data/train_data_preprocessed.csv")
+
+# Save recipe for reuse later (e.g., Step 8 or production pipeline)
+saveRDS(explosive_recipe, "data/explosive_recipe.rds")
+
+
+```
+
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# STEP 8: XGBoost Model Setup + Tuning (10-fold, 10-grid)
+#  ─────────────────────────────────────────────────────────────
+
+# In this step, we configure and tune an XGBoost classifier using the `tidymodels` 
+# framework. We first register parallel processing with `plan(multisession)` and 
+# `doParallel` to accelerate grid search operations across CPU cores. We then define 
+# a 5-fold stratified cross-validation object (`vfold_cv`) to ensure that explosive 
+# and non-explosive plays are balanced across each fold.
+
+# The XGBoost model itself is built using `boost_tree()` with several hyperparameters 
+# set to `tune()`: `tree_depth`, `learn_rate`, `loss_reduction`, `mtry`, and 
+# `sample_size`. We use `workflow()` to bundle the model with our preprocessing 
+# recipe, ensuring consistent treatment of the data during each fold. For tuning, 
+# we use a Latin Hypercube sampling strategy (`grid_latin_hypercube`) with a size of 
+# 20 and an expanded `mtry` range from 10 to 50 — optimized for your high-RAM system.
+
+# We then track runtime and launch the tuning process with `tune_grid()`, saving 
+# out-of-sample predictions and ROC AUC scores for each hyperparameter combination. 
+# Once tuning is complete, the results are saved to disk (`xgb_tuning_results.RDS`) 
+# and the best models are visualized and ranked using `show_best()` and `autoplot()`. 
+# This grid search identifies the best combination of hyperparameters to finalize 
+# in Step 9.
+
+# Parallel processing plan
+plan(multisession)
+registerDoParallel()
+
+# Stratified 5-fold CV
+set.seed(90210)
+folds <- vfold_cv(train_data, v = 10, strata = explosive)
+
+# Define XGBoost classifier (no class weight)
+xgb_model <- boost_tree(
+  mode = "classification",
+  trees = 1000,
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  mtry = tune(),
+  sample_size = tune()
+) %>%
+  set_engine("xgboost")  # No scale_pos_weight
+
+# Combine into workflow
+xgb_workflow <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(explosive_recipe)
+
+# Latin Hypercube tuning grid
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  learn_rate(),
+  loss_reduction(),
+mtry(range = c(10, 50)),
+  sample_size = sample_prop(),
+  size = 20  # Use 20 for final full run
+)
+
+# Track runtime
+start_time <- proc.time()
+
+# Tune the model
+set.seed(90210)
+xgb_results <- tune_grid(
+  xgb_workflow,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE, verbose = TRUE),
+  metrics = metric_set(roc_auc)
+)
+
+# End timer
+end_time <- proc.time()
+print(end_time - start_time)
+
+# Save results
+if (!dir.exists("data")) dir.create("data")
+saveRDS(xgb_results, file = "data/xgb_tuning_results.RDS")
+
+
+
+show_best(xgb_results, metric = "roc_auc")
+autoplot(xgb_results)
+
+# Load tuning results back into environment
+# xgb_results <- readRDS("data/xgb_tuning_results.RDS")
+
+# ───────────────────────────────
+# SAVE Step 8 Outputs
+# ───────────────────────────────
+
+# Save tuning grid and cross-validation folds
+saveRDS(xgb_grid, "data/xgb_tuning_grid.rds")
+saveRDS(folds, "data/cv_folds.rds")
+
+# Save tuning results (already included above)
+saveRDS(xgb_results, file = "data/xgb_tuning_results.RDS")
+
+# Save best performing hyperparameter combo (optional)
+best_params <- select_best(xgb_results, metric = "roc_auc")
+write_csv(best_params, "data/xgb_best_params.csv")
+
+
+# Create the tuning plot object with a gray background
+xgb_auc_plot <- autoplot(xgb_results) +
+  ggtitle("XGBoost Tuning Results: ROC AUC") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background = element_rect(fill = "#F0F0F0", color = NA),  # light gray background
+    panel.background = element_rect(fill = "#F0F0F0", color = NA)
+  )
+
+# Save the plot
+ggsave("outputs/xgb_tuning_auc_plot.png", plot = xgb_auc_plot, width = 9, height = 6, dpi = 300)
+
+# (Optional) Save plot object for future reuse
+saveRDS(xgb_auc_plot, "outputs/xgb_tuning_auc_plot.RDS")
+
+
+```
+
+
+```{r}
+
+
+# ────────────────────────────────────────────────────────────────
+# STEP 9: Finalize Workflow & Fit on Test Set + Threshold Sensitivity
+# ────────────────────────────────────────────────────────────────
+# In this step, we finalize the best XGBoost model based on the results from hyperparameter 
+# tuning in Step 8. After selecting the optimal parameter combination using `select_best()` 
+# (based on ROC AUC), we plug those values into our XGBoost workflow with `finalize_workflow()`. 
+# We then use `last_fit()` to train the final model on the full training data and evaluate 
+# it against the held-out test set. Model performance is summarized with `collect_metrics()` 
+# and visualized using a confusion matrix heatmap (`autoplot()`), defaulting to a 0.5 
+# classification threshold.
+
+# Beyond default threshold evaluation, we conduct threshold sensitivity analysis by 
+# calculating precision, recall, and F1 score across a range of classification cutoffs 
+# (0.1 to 0.9). This manual mapping helps assess trade-offs between false positives and 
+# false negatives, guiding threshold tuning for specific use cases. The performance curves 
+# are visualized with `ggplot`, and both raw predictions and performance metrics are saved 
+# to disk for later reporting or use in visual GT tables or player-level summaries. 
+
+
+# ────────────────────────────────────────────────────────────────
+# STEP 9: Finalize Workflow & Fit on Test Set + Threshold Sensitivity
+# 0.39 Threshold 
+#  ─────────────────────────────────────────────────────────────
+# STEP 9: Finalize and Evaluate Best XGBoost Model -----------------------------
+
+# Track runtime
+start_time <- proc.time()
+
+# 1. Select best combo of tuning parameters from tuning results
+best_params <- select_best(xgb_results, metric = "roc_auc")
+
+# 2. Finalize the workflow using the best parameters
+final_xgb_workflow <- finalize_workflow(
+  xgb_workflow,
+  best_params
+)
+
+# 3. Fit the finalized model on the full training data and evaluate on the test set
+final_fit <- final_xgb_workflow %>%
+  last_fit(split = splits)
+
+# 4. Collect predictions and performance metrics on test set
+final_preds   <- final_fit %>% collect_predictions()
+final_metrics <- final_fit %>% collect_metrics()
+print(final_metrics)
+
+# 5. Create and plot confusion matrix (Predicted vs Actual at default 0.5 threshold)
+final_preds %>%
+  conf_mat(truth = explosive, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(
+    title = "Confusion Matrix: Explosive Play Classifier",
+    subtitle = "Predicted vs Actual (Threshold = 0.5)",
+    x = "Actual",
+    y = "Predicted"
+  )
+
+
+# Define thresholds
+thresholds <- seq(0.1, 0.9, by = 0.05)
+
+# Compute metrics manually for each threshold
+f_scores <- map_df(thresholds, ~{
+  preds_thresh <- final_preds %>%
+    mutate(pred_class = factor(if_else(.pred_1 >= .x, "1", "0"), levels = c("0", "1")))
+
+  # Confusion matrix elements
+  TP <- sum(preds_thresh$pred_class == "1" & preds_thresh$explosive == "1")
+  FP <- sum(preds_thresh$pred_class == "1" & preds_thresh$explosive == "0")
+  FN <- sum(preds_thresh$pred_class == "0" & preds_thresh$explosive == "1")
+
+  # Safe division
+  precision <- ifelse((TP + FP) == 0, NA, TP / (TP + FP))
+  recall    <- ifelse((TP + FN) == 0, NA, TP / (TP + FN))
+  f1_score  <- ifelse(is.na(precision) | is.na(recall) | (precision + recall) == 0, NA,
+                      2 * (precision * recall) / (precision + recall))
+
+  tibble(
+    threshold = .x,
+    precision = precision,
+    recall = recall,
+    f_meas = f1_score
+  )
+})
+
+
+# Pivot to long format for ggplot
+f_scores_long <- f_scores %>%
+  pivot_longer(cols = c("precision", "recall", "f_meas"), names_to = ".metric", values_to = ".estimate")
+
+# Plot
+f_scores_long %>%
+  ggplot(aes(x = threshold, y = .estimate, color = .metric)) +
+  geom_line(linewidth = 1.2, na.rm = TRUE) +
+  geom_point(size = 2, na.rm = TRUE) +
+  labs(
+    title = "Precision / Recall / F1 Across Thresholds",
+    subtitle = "Threshold Sensitivity for Explosive Play Classifier",
+    x = "Classification Threshold",
+    y = "Score"
+  ) +
+  theme_minimal(base_size = 14)
+
+# 8. Export predictions and metrics to disk for reporting or visualization
+if (!dir.exists("data")) dir.create("data")
+write_csv(final_preds,  "data/final_test_predictions.csv")
+write_csv(final_metrics, "data/final_test_metrics.csv")
+
+glimpse(final_preds)
+
+# ───────────────────────────────
+# SAVE Step 9 Outputs (with gray background)
+# ───────────────────────────────
+
+# 1. Save final XGBoost model object
+saveRDS(final_fit, "data/final_xgb_fit.rds")
+
+# 2. Save predictions and performance metrics
+write_csv(final_preds,  "data/final_test_predictions.csv")
+write_csv(final_metrics, "data/final_test_metrics.csv")
+
+# 3. Save threshold sweep F1/Precision/Recall table
+write_csv(f_scores, "data/threshold_sensitivity_scores.csv")
+
+# 4. Save confusion matrix heatmap plot (GRAY BACKGROUND)
+conf_matrix_plot <- final_preds %>%
+  conf_mat(truth = explosive, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(
+    title = "Confusion Matrix: Explosive Play Classifier",
+    subtitle = "Predicted vs Actual (Threshold = 0.5)",
+    x = "Actual",
+    y = "Predicted"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.background = element_rect(fill = "#F0F0F0", color = NA))
+
+ggsave("outputs/confusion_matrix_heatmap.png", plot = conf_matrix_plot, width = 7, height = 5, dpi = 300)
+
+# 5. Save threshold sensitivity plot (GRAY BACKGROUND)
+threshold_plot <- f_scores_long %>%
+  ggplot(aes(x = threshold, y = .estimate, color = .metric)) +
+  geom_line(linewidth = 1.2, na.rm = TRUE) +
+  geom_point(size = 2, na.rm = TRUE) +
+  labs(
+    title = "Precision / Recall / F1 Across Thresholds",
+    subtitle = "Threshold Sensitivity for Explosive Play Classifier",
+    x = "Classification Threshold",
+    y = "Score"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.background = element_rect(fill = "#F0F0F0", color = NA))
+
+ggsave("outputs/threshold_sensitivity_plot.png", plot = threshold_plot, width = 8, height = 5, dpi = 300)
+
+# End timer
+end_time <- proc.time()
+print(end_time - start_time)
+
+```
+
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# STEP 10: Feature Importance
+# Identify the most influential predictors driving the XGBoost model
+# ────────────────────────────────────────────────────────────────
+# This step evaluates which input features were most influential in determining the likelihood 
+# of an explosive play. Using the `vi()` function (Variable Importance) from the `vip` package, 
+# we extract the top 20 predictors based on their relative contribution to the model’s decision trees.
+
+# The output is visualized using a horizontal bar chart created with `ggplot2`, where features 
+# are ranked by their importance. A blue gradient fill provides visual emphasis, matching the 
+# styling used throughout earlier plots (e.g., confusion matrix and scatterplots). This chart 
+# provides critical insight into which variables (e.g., defensive alignment, down-distance context, 
+# NGS features) are driving the model’s predictive power and can also guide future feature engineering.
+
+
+# 0. Extract final model
+final_model <- extract_fit_parsnip(final_fit$.workflow[[1]])
+
+# 1. Get top 20 most important features
+vip_df <- vi(final_model) %>%
+  slice_max(Importance, n = 20)
+
+# 2. Save importance table
+write_csv(vip_df, "data/xgb_top20_feature_importance.csv")
+saveRDS(vip_df, "data/xgb_top20_feature_importance.rds")
+
+# 3. Create and save plot
+vip_plot <- vip_df %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance, fill = Importance)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#c6dbef", high = "#08306b") +
+  labs(
+    title = "Top 20 Most Important Features",
+    subtitle = "XGBoost Model - Explosive Play Classifier",
+    x = "Feature",
+    y = "Importance",
+    fill = "Importance"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+
+# ───────────────────────────────
+# SAVE Step 10 Outputs
+# ───────────────────────────────
+
+# 1. Save variable importance table as CSV
+write_csv(vip_df, "data/xgb_top20_feature_importance.csv")
+
+# 2. Save variable importance plot as PNG and RDS
+ggsave("outputs/xgb_top20_feature_importance.png", plot = vip_plot, width = 8, height = 6, dpi = 300, bg = "white")
+saveRDS(vip_plot, "outputs/xgb_top20_feature_importance.RDS")
+
+
+
+```
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# STEP 11: Predict + Augment for XOE
+# Augments the test set with model predictions and calculates Explosives Over Expected
+# ────────────────────────────────────────────────────────────────
+# This step attaches the model’s predicted probabilities (`.pred_1`) for explosive plays 
+# to each row in the test set using the `augment()` function from `workflowsets`. It then 
+# calculates Explosives Over Expected (XOE) by subtracting the predicted probability 
+# from the actual binary outcome (1 for explosive, 0 for non-explosive). 
+
+# This creates a continuous XOE metric for each play, indicating how much more or less 
+# explosive the play was than the model expected. Positive values indicate an 
+# overperformance relative to expectations, while negative values indicate underperformance.
+
+# Finally, the enriched test set (`test_augmented`) is exported for use in downstream 
+# analysis (e.g., player rankings, personnel evaluation, visualizations in Steps 12–14).
+
+
+# ────────────────────────────────────────────────────────────────
+# STEP 11: Predict + Augment for XOE
+# ─────────────────────────────────────────────────────────────
+
+# Attach predictions to original test set
+test_augmented <- final_fit %>% augment()
+
+# Add Explosives Over Expected (XOE) column
+test_augmented <- test_augmented %>%
+  mutate(xoe = as.numeric(explosive) - .pred_1)
+
+# Quick check: top rows
+glimpse(test_augmented)
+
+# Export full augmented test set
+write_csv(test_augmented, "data/final_test_augmented.csv")
+
+
+
+# Saving a lighter summary with key columns
+test_augmented %>%
+  select(play_id, game_id, posteam, explosive, .pred_1, xoe) %>%
+  write_csv("data/test_augmented_key_fields.csv")
+
+
+# ───────────────────────────────
+# SAVE Step 11 Outputs
+# ───────────────────────────────
+
+# Save full augmented test set (includes all features + XOE)
+write_csv(test_augmented, "data/final_test_augmented.csv")
+saveRDS(test_augmented, "data/final_test_augmented.RDS")
+
+```
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# STEP 12: Summarize Explosives Over Expected (XOE) by Player and Personnel Groups
+# Create player-level and formation-level views of model over/underperformance
+# ────────────────────────────────────────────────────────────────
+
+# In Step 12A, we begin by combining predictions with the test set and assigning player names to each play 
+# using either the rusher or receiver field from the play-by-play data. We calculate a per-play metric 
+# called Explosives Over Expected (XOE) — the difference between the actual binary explosive outcome and 
+# the model’s predicted probability. Then, we summarize XOE by player, computing their total plays, average XOE, 
+# number of explosive plays, and average predicted probability. We apply a 20-play filter to ensure sample reliability, 
+# and export the final table to CSV for use in later steps and visualizations.
+
+
+# ────────────────────────────────────────────────────────────────
+# STEP 12A: Summarize by Player 
+#  ─────────────────────────────────────────────────────────────
+
+# 1. Get predictions and explicitly bind with test_data while renaming for safety
+final_preds <- final_fit %>% collect_predictions()
+
+# Ensure explosive from test_data is retained
+test_augmented <- test_data %>%
+  mutate(explosive_actual = explosive) %>%  # Rename to avoid naming conflicts
+  bind_cols(final_preds %>% select(-explosive)) %>%  # Drop conflicting column
+  mutate(xoe = as.numeric(explosive_actual) - .pred_1)
+
+# 2. Add rusher/receiver player names from original pbp
+test_augmented <- test_augmented %>%
+  left_join(
+    pbp %>% select(game_id, play_id, rusher_player_name, receiver_player_name),
+    by = c("game_id", "play_id")
+  ) %>%
+  mutate(player = coalesce(rusher_player_name, receiver_player_name))
+
+# 3. Save full test set with predictions + players
+write_csv(test_augmented, "data/final_test_augmented.csv")
+
+# 4. Summarize XOE by player
+xoe_by_player <- test_augmented %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarize(
+    total_plays = n(),
+    avg_xoe = mean(xoe, na.rm = TRUE),
+    total_explosives = sum(explosive_actual == 1),
+    avg_pred = mean(.pred_1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_xoe)) %>%
+  filter(total_plays >= 20)
+
+
+
+# ───────────────────────────────
+# SAVE Step 12A Outputs
+# ───────────────────────────────
+
+# Save augmented test set with player names and XOE
+write_csv(test_augmented, "data/final_test_augmented.csv")
+saveRDS(test_augmented, "data/final_test_augmented.RDS")
+
+# Save player-level XOE summary (using `explosive_actual`)
+write_csv(xoe_by_player, "data/xoe_by_player.csv")
+saveRDS(xoe_by_player, "data/xoe_by_player.RDS")
+
+# Top 20 preview table
+xoe_by_player %>%
+  slice_max(avg_xoe, n = 20) %>%
+  write_csv("data/xoe_by_player_top20.csv")
+
+
+
+# ────────────────────────────────────────────────────────────────
+# STEP 12B: Summarize by Player
+#  ─────────────────────────────────────────────────────────────
+
+
+# In Step 12B, we repeat the player-level summary using the `explosive` field from the predictions (instead of `explosive_actual`) 
+# for consistency across downstream applications. The results are filtered, sorted, and exported to `xoe_by_player.csv` to be used in 
+# Step 13 visualizations (e.g., scatterplots and GT tables). This ensures player evaluations reflect the most up-to-date and clean predictions.
+
+
+
+xoe_by_player <- test_augmented %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarize(
+    total_plays = n(),
+    avg_xoe = mean(xoe, na.rm = TRUE),
+    total_explosives = sum(explosive == 1),
+    avg_pred = mean(.pred_1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_xoe)) %>%
+  filter(total_plays >= 20)
+
+# ───────────────────────────────
+# SAVE Step 12B Outputs
+# ───────────────────────────────
+
+# Save the XOE summary that uses the predicted explosive outcome
+# rather than `explosive_actual` — used for downstream plots (13A, 13AB, 13AC)
+
+write_csv(xoe_by_player, "data/xoe_by_player_predicted.csv")
+saveRDS(xoe_by_player, "data/xoe_by_player_predicted.RDS")
+
+
+# ────────────────────────────────────────────────────────────────
+# STEP 12C: Summarize by Offensive Personnel
+# ─────────────────────────────────────────────────────────────
+
+
+# In Steps 12C and 12D, we analyze performance by offensive and defensive personnel groupings respectively. 
+# This includes calculating the number of plays, average XOE, count of actual explosive plays, and predicted average per group. 
+# The offensive summary helps identify which formations outperform expectations, while the defensive summary reveals 
+# which groupings are most and least vulnerable to explosive plays. These results are exported for visualization in Step 13B–13C.
+
+xoe_by_offense_personnel <- test_augmented %>%
+  group_by(offense_personnel) %>%
+  summarize(
+    total_plays = n(),
+    avg_xoe = mean(xoe, na.rm = TRUE),
+    total_explosives = sum(explosive == 1),
+    avg_pred = mean(.pred_1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_xoe)) %>%
+  filter(total_plays >= 20)
+
+# ───────────────────────────────
+# SAVE Step 12C Outputs
+# ───────────────────────────────
+
+# Save summary of average XOE by offensive personnel grouping
+write_csv(xoe_by_offense_personnel, "data/xoe_by_offense_personnel.csv")
+saveRDS(xoe_by_offense_personnel, "data/xoe_by_offense_personnel.RDS")
+
+
+# ────────────────────────────────────────────────────────────────
+# STEP 12D: Summarize by Defensive Personnel
+# ─────────────────────────────────────────────────────────────
+xoe_by_defense_personnel <- test_augmented %>%
+  group_by(defense_personnel) %>%
+  summarize(
+    total_plays = n(),
+    avg_xoe = mean(xoe, na.rm = TRUE),
+    total_explosives = sum(explosive == 1),
+    avg_pred = mean(.pred_1),
+    .groups = "drop"
+  ) %>%
+  arrange(avg_xoe) %>%  # Worst to best
+  filter(total_plays >= 20)
+
+
+# ───────────────────────────────
+# SAVE Step 12D Outputs
+# ───────────────────────────────
+
+# Save summary of Explosives Over Expected (XOE) by defensive personnel package.
+# This captures how different defensive alignments perform against explosive plays.
+
+write_csv(xoe_by_defense_personnel, "data/xoe_by_defense_personnel.csv")
+saveRDS(xoe_by_defense_personnel, "data/xoe_by_defense_personnel.RDS")
+
+
+```
+
+```{r}
+
+
+# ────────────────────────────────────────────────────────────────
+# Step 13A: Visualize Top 20 Players by Explosives Over Expected (All Positions)
+# This plot highlights standout performers across all positions using XOE
+# ────────────────────────────────────────────────────────────────
+# This step generates a scatterplot showcasing the top 20 players in the test set based on their average 
+# Explosives Over Expected (XOE), regardless of position. The x-axis represents the number of actual explosive 
+# plays, while the y-axis displays the average XOE, a key metric capturing the difference between actual and expected 
+# explosiveness. Each point is scaled by the number of total plays a player was involved in, and colored using a gradient 
+# that intensifies with higher average XOE values.
+
+# This visualization is essential for identifying overperforming players — those who consistently generate 
+# more explosive plays than the model predicted — and surfacing potential high-impact individuals that may 
+# not be obvious based on traditional stats alone. Labels are added for easy identification, and the blue gradient 
+# offers visual emphasis on standout performance. This serves as a baseline overview before breaking down results by position.
+
+
+# ────────────────────────────────────────────────────────────────
+# Step 13A: Visualize Top 20 Players by Explosives Over Expected (All Positions)
+# ────────────────────────────────────────────────────────────────
+
+# 1. Create Top 20 dataset
+top20_xoe <- xoe_by_player %>%
+  top_n(20, wt = avg_xoe)
+
+# 2. Create plot (with updated gray background)
+top20_xoe_plot <- top20_xoe %>%
+  ggplot(aes(x = total_explosives, y = avg_xoe)) +
+  geom_point(aes(size = total_plays, color = avg_xoe), alpha = 0.9) +
+  geom_text_repel(aes(label = player), size = 4) +
+  scale_color_gradient(low = "#c6dbef", high = "#08306b") +
+  labs(
+    title = "Top 20 Players by Average XOE",
+    subtitle = "Explosives Over Expected vs Actual Explosive Plays",
+    x = "Total Explosive Plays",
+    y = "Avg Explosives Over Expected (XOE)",
+    size = "Total Plays",
+    color = "Avg XOE"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.background = element_rect(fill = "#F0F0F0", color = NA))
+
+# ───────────────────────────────
+# SAVE Step 13A Outputs
+# ───────────────────────────────
+
+# 1. Save Top 20 XOE player data
+write_csv(top20_xoe, "outputs/top20_xoe_players.csv")
+saveRDS(top20_xoe, "outputs/top20_xoe_players.RDS")
+
+# 2. Save Top 20 XOE scatterplot image
+ggsave("outputs/top20_xoe_players.png", plot = top20_xoe_plot, width = 10, height = 6, dpi = 300)
+
+# 3. Save plot object for future use
+saveRDS(top20_xoe_plot, "outputs/top20_xoe_players_plot.RDS")
+
+
+
+```
+
+
+```{r}
+
+
+# ────────────────────────────────────────────────────────────────
+# Step 13AB: Position-Specific XOE Scatterplots — Top 20 by Avg XOE (QB, RB, WR, TE)
+# This step breaks down top XOE performers within each offensive position
+# ────────────────────────────────────────────────────────────────
+
+# This chunk extends the analysis from Step 13A by separating players into their most frequent positions
+# (e.g., QB, RB, WR, TE) to ensure fair comparisons within roles. The code first processes roster data to assign 
+# each player a primary position based on frequency across seasons (2016–2022), ensuring consistency even for players 
+# who may have played multiple roles.
+
+# It then aggregates performance metrics (total plays, average XOE, total explosive plays, average predicted probability) 
+# by player and position. Players with at least 20 plays are included to ensure a meaningful sample. This information 
+# is visualized using a reusable `plot_top20_by_position()` function, which highlights each position’s top 20 
+# overperformers based on Avg XOE. Each point is colored by XOE, sized by volume, and labeled for clarity.
+
+# These position-specific plots (one for QB, RB, WR, TE) provide clearer, role-relevant insights than the all-position 
+# plot in Step 13A. They reveal position-dependent trends, such as QBs typically having lower explosive play rates 
+# but wider performance variance, while RBs and WRs are more explosive on fewer touches.
+
+# ───────────────────────────────
+# SAVE Step 13AB Outputs
+# ───────────────────────────────
+
+# 1. Load most frequent position for each player
+rosters_pos <- nflreadr::load_rosters(2016:2022) %>%
+  mutate(player_short = paste0(str_sub(first_name, 1, 1), ".", last_name)) %>%
+  count(player_short, position, sort = TRUE) %>%
+  group_by(player_short) %>%
+  slice_max(n, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(player_short, position)
+
+# 2. Join positions to augmented test set
+test_augmented_with_pos <- test_augmented %>%
+  mutate(player_short = player) %>%
+  left_join(rosters_pos, by = "player_short")
+
+# 3. Summarize XOE by player and position
+xoe_by_player_pos <- test_augmented_with_pos %>%
+  filter(!is.na(player), !is.na(position)) %>%
+  group_by(player, posteam, position) %>%
+  summarize(
+    total_plays = n(),
+    avg_xoe = mean(xoe, na.rm = TRUE),
+    total_explosives = sum(explosive_actual == 1),
+    avg_pred = mean(.pred_1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(total_plays >= 20)
+
+# 4. Save full summarized table
+write_csv(xoe_by_player_pos, "outputs/xoe_by_player_pos.csv")
+saveRDS(xoe_by_player_pos, "outputs/xoe_by_player_pos.RDS")
+
+# 5. Plotting + saving function by position (with white background)
+plot_top20_by_position <- function(pos) {
+  top_pos <- xoe_by_player_pos %>%
+    filter(position == pos) %>%
+    top_n(20, avg_xoe)
+
+  # Save top 20 table per position
+  write_csv(top_pos, glue::glue("outputs/top20_{tolower(pos)}_xoe.csv"))
+  saveRDS(top_pos, glue::glue("outputs/top20_{tolower(pos)}_xoe.RDS"))
+
+  # Generate plot with white background
+  plot <- top_pos %>%
+    ggplot(aes(x = total_explosives, y = avg_xoe)) +
+    geom_point(aes(size = total_plays, color = avg_xoe)) +
+    geom_text_repel(aes(label = player), size = 4) +
+    scale_color_gradient(low = "#c6dbef", high = "#08306b") +
+    labs(
+      title = glue::glue("Top 20 {pos}s by Average XOE"),
+      subtitle = "Explosives Over Expected vs Actual Explosive Plays",
+      x = "Total Explosive Plays",
+      y = "Avg XOE",
+      size = "Total Plays",
+      color = "Avg XOE"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(plot.background = element_rect(fill = "#FFFFFF", color = NA))
+
+  # Save plot to disk
+  ggsave(
+    filename = glue::glue("outputs/top20_{tolower(pos)}_xoe_plot.png"),
+    plot = plot, width = 10, height = 6, dpi = 300
+  )
+
+  # Save plot object
+  saveRDS(plot, glue::glue("outputs/top20_{tolower(pos)}_xoe_plot.RDS"))
+
+  return(plot)  # Optional if rendering interactively
+}
+
+# 6. Run plots + save for each major position
+plot_top20_by_position("QB")
+plot_top20_by_position("RB")
+plot_top20_by_position("WR")
+plot_top20_by_position("TE")
+
+```
+
+
+
+
+
+```{r}
+
+# ───────────────────────────────────────────────
+# Step 13AC (Fix): Clean and Correct Player Position Tags
+# This step resolves inaccuracies in position tagging due to duplicate or ambiguous entries in roster data
+# ───────────────────────────────────────────────
+# This chunk fixes an earlier limitation in the position-tagging process by ensuring each player is assigned 
+# their **most frequently listed position** across the 2016–2022 seasons. This is done by counting the number of times 
+# each (player_short, position) pair appears and retaining only the top entry per player. This prevents edge cases 
+# where players appeared under multiple roles (e.g., WR and RB) from causing inconsistencies in positional groupings.
+
+# After cleaning, the fixed `rosters_pos` object is joined to the augmented test set (`test_augmented_with_pos`) 
+# using the F.Lastname (`player_short`) format. This results in each player's row in the dataset being paired 
+# with their most likely position.
+
+# Finally, it summarizes the average XOE and related metrics (total plays, explosive plays, average predicted probability)
+# by player and position. The corrected `xoe_by_player_pos` object is essential for generating **accurate and 
+# position-specific** plots and tables in later steps (e.g., Step 13B–14), ensuring that top player rankings reflect 
+# correct positional context.
+
+# 1. Load and clean roster: Get most frequent position per player
+rosters_pos <- nflreadr::load_rosters(2016:2022) %>%
+  mutate(player_short = paste0(str_sub(first_name, 1, 1), ".", last_name)) %>%
+  count(player_short, position, sort = TRUE) %>%
+  group_by(player_short) %>%
+  slice_max(n, with_ties = FALSE) %>%  # Keep most frequent position only
+  ungroup() %>%
+  select(player_short, position)
+
+# Save cleaned roster mapping
+write_csv(rosters_pos, "outputs/rosters_most_frequent_position.csv")
+saveRDS(rosters_pos, "outputs/rosters_most_frequent_position.RDS")
+
+# 2. Attach position info to test_augmented
+test_augmented_with_pos <- test_augmented %>%
+  mutate(player_short = player) %>%
+  left_join(rosters_pos, by = "player_short")
+
+# Save the merged test_augmented_with_pos
+write_csv(test_augmented_with_pos, "outputs/test_augmented_with_pos.csv")
+saveRDS(test_augmented_with_pos, "outputs/test_augmented_with_pos.RDS")
+
+# 3. Summarize XOE by player and position
+xoe_by_player_pos <- test_augmented_with_pos %>%
+  filter(!is.na(player), !is.na(position)) %>%
+  group_by(player, posteam, position) %>%
+  summarize(
+    total_plays = n(),
+    avg_xoe = mean(xoe, na.rm = TRUE),
+    total_explosives = sum(explosive_actual == 1),
+    avg_pred = mean(.pred_1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(total_plays >= 20)
+
+# Save the final summarized player-position XOE table
+write_csv(xoe_by_player_pos, "outputs/xoe_by_player_pos_fixed.csv")
+saveRDS(xoe_by_player_pos, "outputs/xoe_by_player_pos_fixed.RDS")
+
+
+```
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# Step 13B: Visualize Average XOE by Offensive Personnel Grouping
+# This bar chart reveals which offensive personnel packages generate the most unexpected explosive plays
+# ────────────────────────────────────────────────────────────────
+# This step generates a horizontal bar chart to compare **average Explosives Over Expected (XOE)** across 
+# different offensive personnel groupings (e.g., "11", "12", "21"). These groupings represent combinations of 
+# running backs, tight ends, and wide receivers on the field during a play.
+
+# The data is sourced from the `xoe_by_offense_personnel` object, which was previously created in Step 12C by 
+# summarizing the test set. The personnel groups are sorted in ascending order of average XOE, allowing us to 
+# quickly identify which formations tend to outperform (or underperform) expectations.
+
+# This visualization can offer strategic insight into how play design and personnel usage correlate with explosive 
+# play efficiency — an important layer of interpretation for analysts, coaches, and decision-makers evaluating scheme success.
+
+
+
+# 1. Create and save the summarized data
+write_csv(xoe_by_offense_personnel, "outputs/xoe_by_offense_personnel.csv")
+saveRDS(xoe_by_offense_personnel, "outputs/xoe_by_offense_personnel.RDS")
+
+# 2. Create the plot
+offense_xoe_plot <- xoe_by_offense_personnel %>%
+  ggplot(aes(x = reorder(offense_personnel, avg_xoe), y = avg_xoe)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Avg Explosives Over Expected by Offensive Personnel",
+    x = "Offensive Personnel",
+    y = "Avg XOE"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.background = element_rect(fill = "#FFFFFF", color = NA))  # ← White background
+
+# ───────────────────────────────
+# SAVE Step 13B Outputs
+# ───────────────────────────────
+
+# 3. Save the plot
+ggsave("outputs/xoe_by_offensive_personnel.png", plot = offense_xoe_plot, width = 8, height = 5, dpi = 300)
+saveRDS(offense_xoe_plot, "outputs/xoe_by_offensive_personnel_plot.RDS")
+
+
+
+
+```
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# Step 13C: Bar Chart — Average XOE by Defensive Personnel
+# Evaluates which defensive groupings most effectively limit unexpected explosive plays
+# ────────────────────────────────────────────────────────────────
+# This step visualizes the effectiveness of various **defensive personnel packages** (e.g., "4-2-5", "3-4", "2-4-5") 
+# by plotting their **average Explosives Over Expected (XOE)** on a horizontal bar chart.
+
+# The chart uses the `xoe_by_defense_personnel` object built in Step 12D, which aggregates performance metrics 
+# based on how well each personnel group contained explosive plays versus expectation. Personnel packages are 
+# ordered from worst to best, highlighting which defensive looks allow more explosive plays and which ones suppress them.
+
+# This type of visualization provides actionable insights for both defensive strategy and scouting — lower XOE 
+# indicates better-than-expected performance in limiting explosive outcomes, which is a key measure of defensive efficiency.
+
+
+# 1. Save summarized data
+write_csv(xoe_by_defense_personnel, "outputs/xoe_by_defense_personnel.csv")
+saveRDS(xoe_by_defense_personnel, "outputs/xoe_by_defense_personnel.RDS")
+
+# 2. Create the plot with a white background
+defense_xoe_plot <- xoe_by_defense_personnel %>%
+  ggplot(aes(x = reorder(defense_personnel, avg_xoe), y = avg_xoe)) +
+  geom_col(fill = "firebrick") +
+  coord_flip() +
+  labs(
+    title = "Avg Explosives Over Expected by Defensive Personnel",
+    x = "Defensive Personnel",
+    y = "Avg XOE (Lower is Better for Defense)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.background = element_rect(fill = "#FFFFFF", color = NA))  # ← white background
+
+# ───────────────────────────────
+# SAVE Step 13C Outputs
+# ───────────────────────────────
+
+# 3. Save the plot
+ggsave("outputs/xoe_by_defensive_personnel.png", plot = defense_xoe_plot, width = 8, height = 5, dpi = 300)
+saveRDS(defense_xoe_plot, "outputs/xoe_by_defensive_personnel_plot.RDS")
+
+# 4.Preview
+defense_xoe_plot
+
+
+
+
+```
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# Step 13D: Team-Level Explosives Over Expected (XOE)
+# Visualizes offensive explosiveness above expectation by team using NFL logos
+# ────────────────────────────────────────────────────────────────
+# This chunk summarizes and visualizes each **offensive team's average XOE** across the test set.
+# It aggregates plays by `posteam`, computing metrics like total plays, actual explosive plays, 
+# predicted probability average, and the core metric — **avg_xoe** (actual - predicted).
+
+# The visualization uses `nflplotR::geom_nfl_logos()` to replace points with team logos, sorted by
+# `avg_xoe`. Teams with the highest values appear at the top, indicating they generated more explosive 
+# plays than expected. This is useful for benchmarking offensive efficiency across franchises.
+
+# Teams with consistently high XOE may be exceeding expectations due to scheme, talent, or game situations,
+# whereas teams with low or negative XOE may be underperforming relative to model expectations.
+
+
+# 1. Summarize XOE by offensive team
+xoe_by_team <- test_augmented %>%
+  group_by(posteam) %>%
+  summarize(
+    total_plays = n(),
+    avg_xoe = mean(xoe, na.rm = TRUE),
+    total_explosives = sum(explosive_actual == 1),
+    avg_pred = mean(.pred_1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_xoe)) %>%
+  filter(total_plays >= 20)
+
+# 2. Save the summary data
+write_csv(xoe_by_team, "outputs/xoe_by_team.csv")
+saveRDS(xoe_by_team, "outputs/xoe_by_team.RDS")
+
+# 3. Create team logo plot with white background
+xoe_team_plot <- xoe_by_team %>%
+  ggplot(aes(x = avg_xoe, y = reorder(posteam, avg_xoe))) +
+  nflplotR::geom_nfl_logos(aes(team_abbr = posteam), width = 0.06) +
+  labs(
+    title = "Team-Level Explosives Over Expected (XOE)",
+    subtitle = "Higher Avg XOE Indicates More Unexpected Explosiveness",
+    x = "Avg XOE",
+    y = "Team"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.background = element_rect(fill = "#FFFFFF", color = NA))  # ← white background
+
+
+# ───────────────────────────────
+# SAVE Step 13D Outputs
+# ───────────────────────────────
+
+# 4. Save the plot
+ggsave("outputs/xoe_by_team_logos.png", plot = xoe_team_plot, width = 8, height = 6, dpi = 300)
+saveRDS(xoe_team_plot, "outputs/xoe_by_team_logos_plot.RDS")
+
+# 5. Optional preview
+xoe_team_plot
+
+
+
+```
+
+```{r}
+# ────────────────────────────────────────────────────────────────
+# Step 13E: Player-Level Scatterplot with Logos and Trend Line
+# Save summary data + plot with NFL logos and trendline
+# ────────────────────────────────────────────────────────────────
+
+
+# 1. Summarize player performance
+xoe_player_logos <- test_augmented %>%
+  filter(!is.na(player)) %>%
+  group_by(player, posteam) %>%
+  summarize(
+    total_plays = n(),
+    avg_xoe = mean(xoe, na.rm = TRUE),
+    total_explosives = sum(explosive_actual == 1),
+    avg_pred = mean(.pred_1),
+    .groups = "drop"
+  ) %>%
+  filter(total_plays >= 20)
+
+# 2. Save summarized player performance
+write_csv(xoe_player_logos, "outputs/xoe_by_player_logos.csv")
+saveRDS(xoe_player_logos, "outputs/xoe_by_player_logos.RDS")
+
+# 3. Build the Top 15 XOE player plot with logos and trend line (white background added)
+xoe_player_plot <- xoe_player_logos %>%
+  top_n(15, wt = avg_xoe) %>%
+  ggplot(aes(x = total_explosives, y = avg_xoe)) +
+  geom_nfl_logos(aes(team_abbr = posteam), width = 0.075) +
+  geom_text_repel(aes(label = player), size = 4, max.overlaps = 20) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "gray30", linewidth = 1) +
+  labs(
+    title = "Top 15 Players by Avg Explosives Over Expected (XOE)",
+    subtitle = "Trend Line Shows Linear Relationship — Outperformers Above",
+    x = "Total Explosive Plays",
+    y = "Avg Explosives Over Expected (XOE)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.background = element_rect(fill = "#FFFFFF", color = NA))  # ← white background
+
+# ───────────────────────────────
+# SAVE Step 13E Outputs
+# ───────────────────────────────
+
+# 4. Save the plot
+ggsave("outputs/xoe_player_scatter_logos.png", plot = xoe_player_plot, width = 8, height = 6, dpi = 300)
+saveRDS(xoe_player_plot, "outputs/xoe_player_scatter_logos_plot.RDS")
+
+# 5. Optional preview
+xoe_player_plot
+
+
+
+```
+
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# Step 14A: GT Table for Top 15 Players by XOE
+# Visual table summarizing top player performance with logos and headshots
+# ────────────────────────────────────────────────────────────────
+
+# This step generates a professional-grade `gt` table featuring the top 15 players 
+# by average Explosives Over Expected (XOE). The table highlights player impact 
+# visually using embedded headshots and team logos, styled with an ESPN-style theme.
+
+# It begins by creating a consistent short name (F.Lastname) to join player-level 
+# XOE metrics with headshot URLs from the NFL roster and logo links from `teams_colors_logos`.
+
+# The final `gt_tbl` includes:
+# • Player name, headshot, and team logo
+# • Total plays and total explosives
+# • Average XOE and predicted probability (avg_pred)
+# • Gradient-colored XOE column for visual emphasis
+
+# The result is a clean, presentation-ready summary for high-impact performers, 
+# sorted by XOE, and saved as a PNG file for external use.
+
+
+# 2. Build short name in roster (F.Lastname format) to match `player`
+rosters <- nflreadr::load_rosters(2010:2022) %>%
+  mutate(
+    player_short = paste0(str_sub(first_name, 1, 1), ".", last_name)
+  ) %>%
+  select(player_short, headshot_url) %>%
+  distinct()
+
+# 3. Load team logos
+teams <- teams_colors_logos %>%
+  select(team_abbr, team_logo = team_logo_wikipedia)
+
+# 4. Top 15 players
+top_15_xoe <- xoe_by_player %>%
+  top_n(15, avg_xoe) %>%
+  arrange(desc(avg_xoe))
+
+# 5. Join team and headshot info (remove roster duplicates safely)
+top_15_with_info <- top_15_xoe %>%
+  left_join(test_augmented %>% select(player, posteam), by = "player") %>%
+  distinct(player, .keep_all = TRUE) %>%
+  left_join(
+    rosters %>% group_by(player_short) %>% dplyr::slice(1) %>% ungroup(),
+    by = c("player" = "player_short")
+  ) %>%
+  left_join(teams, by = c("posteam" = "team_abbr"))
+
+# 6. Build GT table with headshots as first column and colored XOE
+gt_tbl <- top_15_with_info %>%
+  gt() %>%
+  gt_img_rows(columns = headshot_url, height = 40) %>%  # 👤 Headshots
+  gt_img_rows(columns = team_logo, height = 40) %>%     # 🏈 Logos
+  fmt_number(columns = c(avg_xoe, avg_pred), decimals = 3) %>%
+  data_color(
+    columns = c(avg_xoe),  # ✅ FIXED: no vars()
+    colors = scales::col_numeric(
+      palette = c("#c6dbef", "#6a51a3"),  # Light blue → deep purple
+      domain = range(top_15_with_info$avg_xoe, na.rm = TRUE)
+    )
+  ) %>%
+  tab_header(
+    title = md("**Top 15 Players by Explosives Over Expected (XOE)**"),
+    subtitle = "Min 20 plays | Headshots + Logos + Gradient Avg XOE"
+  ) %>%
+  cols_label(
+    headshot_url = "",  # No label for headshot
+    player = "Player",
+    team_logo = "Team",
+    total_plays = "Total Plays",
+    total_explosives = "Explosives",
+    avg_xoe = "Avg XOE",
+    avg_pred = "Avg Pred"
+  ) %>%
+  cols_move_to_start(columns = headshot_url) %>%
+  tab_options(
+    table.font.size = px(14),
+    column_labels.font.weight = "bold"
+  ) %>%
+  gt_theme_espn()
+
+# 7. Save output
+gtsave(gt_tbl, filename = "outputs/top_15_xoe_with_headshots.png")
+
+
+gt_tbl
+
+
+```
+
+
+```{r}
+
+# ────────────────────────────────────────────────────────────────
+# Step 14B: GT Tables by Position (Fixed slice error + deduplication)
+# Visual leaderboard tables for each position (QB, RB, WR, TE)
+# ────────────────────────────────────────────────────────────────
+
+# This step expands on the prior GT table by creating four separate position-based leaderboards. 
+# Each table highlights the top 15 players in that position group (e.g., QBs, WRs) by average 
+# Explosives Over Expected (XOE), using professional formatting with headshots, team logos, and color gradients.
+
+# A helper function `generate_gt_table_by_position()` is defined to:
+# • Filter `xoe_by_player_pos` for the given position
+# • Remove duplicate player entries (ensures uniqueness)
+# • Join in player headshots and team logos
+# • Format the table with clear labels, bold headers, and XOE-colored cells using `gt` and `gtExtras`
+
+# Four tables are saved as PNGs in the `outputs/` folder:
+# • `top_15_qb_xoe.png`
+# • `top_15_rb_xoe.png`
+# • `top_15_wr_xoe.png`
+# • `top_15_te_xoe.png`
+
+# These tables are suitable for inclusion in slides, reports, or dashboards, and help stakeholders 
+# understand which players outperform expectations based on their position group context.
+
+
+# 1. Reuse existing xoe_by_player_pos from Step 13A
+
+# 2. Load headshots and team logos
+rosters_pos <- nflreadr::load_rosters(2016:2022) %>%
+  mutate(player_short = paste0(str_sub(first_name, 1, 1), ".", last_name)) %>%
+  group_by(player_short) %>%
+  slice_head(n = 1) %>%  # ✅ Fixed the slice error here
+  ungroup() %>%
+  select(player_short, headshot_url)
+
+teams <- teams_colors_logos %>%
+  select(team_abbr, team_logo = team_logo_wikipedia)
+
+# 3. Helper function to generate GT table per position
+generate_gt_table_by_position <- function(pos_abbr) {
+  top_pos <- xoe_by_player_pos %>%
+    filter(position == pos_abbr) %>%
+    arrange(desc(avg_xoe)) %>%
+    distinct(player, .keep_all = TRUE) %>%  # ✅ Remove duplicates
+    slice_head(n = 15) %>%
+    left_join(rosters_pos, by = c("player" = "player_short")) %>%
+    left_join(teams, by = c("posteam" = "team_abbr"))
+
+  gt_table <- top_pos %>%
+    gt() %>%
+    gt_img_rows(columns = headshot_url, height = 40) %>%
+    gt_img_rows(columns = team_logo, height = 40) %>%
+    fmt_number(columns = c(avg_xoe, avg_pred), decimals = 3) %>%
+    data_color(
+      columns = c(avg_xoe),
+      colors = scales::col_numeric(
+        palette = c("#c6dbef", "#6a51a3"),
+        domain = range(top_pos$avg_xoe, na.rm = TRUE)
+      )
+    ) %>%
+    tab_header(
+      title = md(glue::glue("**Top 15 {pos_abbr}s by Explosives Over Expected (XOE)**")),
+      subtitle = "Min 20 plays | Headshots + Logos + Gradient Avg XOE"
+    ) %>%
+    cols_label(
+      headshot_url = "",
+      player = "Player",
+      team_logo = "Team",
+      position = "Position",
+      total_plays = "Total Plays",
+      total_explosives = "Explosives",
+      avg_xoe = "Avg XOE",
+      avg_pred = "Avg Pred"
+    ) %>%
+    cols_move_to_start(columns = headshot_url) %>%
+    tab_options(
+      table.font.size = px(14),
+      column_labels.font.weight = "bold"
+    ) %>%
+    gtExtras::gt_theme_espn()
+
+  # Make sure the outputs folder exists
+  if (!dir.exists("outputs")) {
+    dir.create("outputs")
+  }
+
+  # Save the GT table
+  gtsave(gt_table, filename = glue::glue("outputs/top_15_{tolower(pos_abbr)}_xoe.png"))
+}
+
+# 4. Run for all four main positions
+generate_gt_table_by_position("QB")
+generate_gt_table_by_position("RB")
+generate_gt_table_by_position("WR")
+generate_gt_table_by_position("TE")
+
+
+```
+
+
+
+
+
