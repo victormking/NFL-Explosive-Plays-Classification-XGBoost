@@ -60,14 +60,3 @@ This score shows the model has a moderate ability to distinguish between explosi
 
 Brier Score: 0.2192
 Lower is better here. This value reflects how well-calibrated the predicted probabilities are. A score around 0.21–0.22 is acceptable for imbalanced binary classification problems.
-
-Confusion Matrix (Threshold = 0.5):
-
-True Negatives (Top Left): 21,980
-
-False Positives (Top Right): 2,376
-
-False Negatives (Bottom Left): 14,572
-
-True Positives (Bottom Right): 4,905
-This tells us that the model missed quite a few explosive plays (high false negatives) but did a good job not over-predicting them (low false positives).
