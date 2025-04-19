@@ -31,7 +31,6 @@ Using a powerful gradient boosting classifier (XGBoost), we trained and evaluate
 │
 └── README.md – This file
 
-
 ## 📊 Visual Highlights
 
 ### Top 15 Players by Average Explosives Over Expected (XOE)
