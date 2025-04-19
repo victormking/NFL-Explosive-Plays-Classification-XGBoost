@@ -30,22 +30,22 @@ plaintext
 │   └── Xboost_NFL_Explosive_Plays.Rmd – Fully commented final source code
 
 
-## 📊 Visual Highlights
+## 📈 Visual Highlights
 
-### 🔝 Top 15 Players by Average Explosives Over Expected (XOE)
-![Top 15 Players by Avg XOE](https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/blob/main/outputs/Step%2014%20A/top_15_xoe_with_headshots.png?raw=true)
-
----
-
-### 🧢 Team-Level XOE Comparison
-![Team XOE](https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/blob/main/outputs/Step%2013/xoe_by_team_logos.png?raw=true)
+#### 🧨 Top 15 Players by Average Explosives Over Expected (XOE)  
+![Top 15 Players by Avg XOE](outputs/Step%2014%20A/top_15_xoe_with_headshots.png)
 
 ---
 
-### 👥 Explosiveness by Offensive Personnel
-![XOE by Offensive Personnel](https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/blob/main/outputs/Step%2013/xoe_by_offensive_personnel.png?raw=true)
+#### 🧮 Team-Level Evaluation: Precision, Recall, and F1 Across Thresholds  
+![Threshold Sensitivity Curve](outputs/Step%209/threshold_sensitivity_plot.png)
 
 ---
 
-### 🛡️ Explosiveness by Defensive Personnel
-![XOE by Defensive Personnel](https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/blob/main/outputs/Step%2013/xoe_by_defensive_personnel.png?raw=true)
+#### 🧠 XGBoost Feature Importance  
+![Top 20 Feature Importances](outputs/Step%2010/xgb_top20_feature_importance.png)
+
+---
+
+#### 🚀 Player-Level Performance: Explosives vs Expected  
+![Top 20 XOE Players](outputs/Step%2013%20A/top20_xoe_players.png)
