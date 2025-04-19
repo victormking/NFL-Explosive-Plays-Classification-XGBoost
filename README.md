@@ -33,19 +33,19 @@ plaintext
 ## 📊 Visual Highlights
 
 ### 🔝 Top 15 Players by Average Explosives Over Expected (XOE)
-![Top 15 Players by Avg XOE](outputs/Step%2014%20A/top_15_xoe_with_headshots.png)
+![Top 15 Players by Avg XOE](https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/blob/main/outputs/Step%2014%20A/top_15_xoe_with_headshots.png?raw=true)
 
 ---
 
 ### 🧢 Team-Level XOE Comparison
-![Team XOE](outputs/Step%2013/xoe_by_team_logos.png)
+![Team XOE](https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/blob/main/outputs/Step%2013/xoe_by_team_logos.png?raw=true)
 
 ---
 
 ### 👥 Explosiveness by Offensive Personnel
-![XOE by Offensive Personnel](outputs/Step%2013/xoe_by_offensive_personnel.png)
+![XOE by Offensive Personnel](https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/blob/main/outputs/Step%2013/xoe_by_offensive_personnel.png?raw=true)
 
 ---
 
 ### 🛡️ Explosiveness by Defensive Personnel
-![XOE by Defensive Personnel](outputs/Step%2013/xoe_by_defensive_personnel.png)
+![XOE by Defensive Personnel](https://github.com/victormking/NFL-Explosive-Plays-Classification-XGBoost/blob/main/outputs/Step%2013/xoe_by_defensive_personnel.png?raw=true)
